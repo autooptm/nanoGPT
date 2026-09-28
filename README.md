@@ -1,3 +1,66 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>nanoGPT · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.41x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.41x-2ea44f"></a>
+    <a href="https://github.com/karpathy/nanoGPT/commit/3adf61e154c3fe3fca428ad6bc3818b27a3b8291"><img alt="base" src="https://img.shields.io/badge/upstream-3adf61e154c3-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-NVIDIA%20RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT) at commit
+> [`3adf61e154c3`](https://github.com/karpathy/nanoGPT/commit/3adf61e154c3fe3fca428ad6bc3818b27a3b8291) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is kept under [`.autooptm/`](.autooptm/).
+
+Every optimisation is on by default and the command runs unchanged — same file, same flags, same outputs. Every change is behind a switch that defaults on; see `.autooptm/autooptm.patch`.
+
+## The result — `python train.py config/train_shakespeare_char.py --compile=False --max_iters=400 --eval_interval=200 --log_interval=10`
+
+| | |
+|---|---|
+| **Command** | `python train.py config/train_shakespeare_char.py --compile=False --max_iters=400 --eval_interval=200 --log_interval=10` |
+| **Entry point** | `train.py` |
+| **Unit measured** | one training iteration of train.py (shakespeare_char, --compile=False) |
+| **Before (stock)** | 0.01134 (as reported) per unit |
+| **After (this tree, all switches default ON)** | 0.008683 (as reported) per unit |
+| **Speedup** | **1.41x** end to end on NVIDIA RTX 4090, host noise floor 0.2% |
+| **Output** | default tree: loss trajectory within 8e-5 relative, gradient cosine ≥ 0.99999; one switch removes the only precision change (1.245x on the isolated step with it off) |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `train.py` | module level, after the model is built (Block.forward) | 1.086x |
+| `train.py` | estimate_loss() | 1.094x |
+| `train.py` | estimate_loss() | 1.01x |
+| `train.py` | get_batch() | 1.077x |
+| `train.py` | the checkpoint write inside the eval branch | 1.034x |
+| `model.py` | GPT.forward | 1.019x |
+| `model.py` | GPT.forward -- embedding and head | 1.074x |
+
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/nanoGPT-ao.git
+cd nanoGPT-ao
+# set up exactly as upstream documents, then:
+python train.py config/train_shakespeare_char.py --compile=False --max_iters=400 --eval_interval=200 --log_interval=10
+```
+
+`git diff 3adf61e154c3` is the same change as the patch file under `.autooptm/`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 
 # nanoGPT
 

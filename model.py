@@ -15,6 +15,33 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+_AO_OPT_4 = False
+_AO_OPT_5 = False
+
+
+def _ao_embed(idx, pos, wte_w, wpe_w, p, training, cast):
+    x = F.embedding(idx, wte_w) + F.embedding(pos, wpe_w)
+    x = F.dropout(x, p, training)
+    return x.to(torch.bfloat16) if cast else x
+
+
+def _ao_head_loss(x, ln_w, ln_b, head_w, targets, cast):
+    x = F.layer_norm(x, ln_w.shape, ln_w, ln_b, 1e-5)
+    if cast:
+        x = x.to(torch.bfloat16)
+    logits = F.linear(x, head_w)
+    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+    return logits, loss
+
+
+def ao_enable(opt_1=False, opt_2=False, opt_3=None):
+    global _AO_OPT_4, _AO_OPT_5, _ao_embed, _ao_head_loss
+    _AO_OPT_4, _AO_OPT_5 = opt_1, opt_2
+    if opt_1 and opt_3 is not None:
+        _ao_embed = opt_3(_ao_embed)
+        _ao_head_loss = opt_3(_ao_head_loss)
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -174,6 +201,17 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
+        if _AO_OPT_4:
+            x = _ao_embed(idx, pos, self.transformer.wte.weight, self.transformer.wpe.weight,
+                          self.config.dropout, self.training, _AO_OPT_5)
+            for block in self.transformer.h:
+                x = block(x)
+            if targets is not None:
+                return _ao_head_loss(x, self.transformer.ln_f.weight, self.transformer.ln_f.bias,
+                                     self.lm_head.weight, targets, _AO_OPT_5)
+            x = self.transformer.ln_f(x)
+            return self.lm_head(x[:, [-1], :]), None
+
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)

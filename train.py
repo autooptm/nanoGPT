@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, Block
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -72,6 +72,11 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+ao_opt_11 = True
+ao_opt_12 = True
+ao_fast_eval = True
+ao_opt_13 = True
+ao_opt_14 = True
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -113,7 +118,30 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+_ao_opt_15 = 64 * 1024 * 1024   # 512 MB as int64
+_ao_corpus = {}
+_ao_cols = None
+def _ao_opt_6(split):
+    if split not in _ao_corpus:
+        f = os.path.join(data_dir, 'train.bin' if split == 'train' else 'val.bin')
+        data = np.memmap(f, dtype=np.uint16, mode='r')
+        _ao_corpus[split] = (torch.from_numpy(np.asarray(data, dtype=np.int64)).to(device)
+                             if len(data) <= _ao_opt_15 else None)
+        if _ao_corpus[split] is None:
+            print(f"[autooptm] {split}.bin has {len(data):,} tokens (> {_ao_opt_15:,}); "
+                  f"keeping the stock get_batch")
+    return _ao_corpus[split]
+
 def get_batch(split):
+    if ao_opt_12 and device_type == 'cuda':
+        corpus = _ao_opt_6(split)
+        if corpus is not None:
+            global _ao_cols
+            if _ao_cols is None:
+                _ao_cols = torch.arange(block_size, device=device)
+            ix = torch.randint(len(corpus) - block_size, (batch_size,))
+            idx = ix.to(device, non_blocking=True)[:, None] + _ao_cols
+            return corpus[idx], corpus[idx + 1]
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
@@ -201,6 +229,26 @@ if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
+_ao_opt_16 = {}
+def _ao_opt_7(fn):
+    def wrapper(*args, **kwargs):
+        c = _ao_opt_16.get(fn)
+        if c is None:
+            import torch._inductor.config as _ao_opt_17
+            _ao_opt_17.fallback_random = True
+            c = _ao_opt_16[fn] = torch.compile(fn)
+        return c(*args, **kwargs)
+    return wrapper
+
+_ao_blocks = ao_opt_11 and not compile
+if _ao_blocks or ao_opt_13:
+    import model as _ao_model_mod
+    if _ao_blocks:
+        print("preparing the model on first use... (~a minute, once)")
+        Block.forward = _ao_opt_7(Block.forward)
+    _ao_model_mod.ao_enable(opt_1=True, opt_2=ao_opt_13,
+                            opt_3=_ao_opt_7 if _ao_blocks else None)
+
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -211,12 +259,67 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+_ao_opt_9 = None
+def _ao_opt_18(o):
+    if torch.is_tensor(o):
+        return o.detach().to('cpu', copy=True)
+    if isinstance(o, dict):
+        return {k: _ao_opt_18(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return type(o)(_ao_opt_18(v) for v in o)
+    return o
+
+def _ao_opt_8():
+    global _ao_opt_9
+    if _ao_opt_9 is not None:
+        _ao_opt_9.join()
+        _ao_opt_9 = None
+
+def _ao_save(obj, path):
+    global _ao_opt_9
+    if not ao_opt_14:
+        torch.save(obj, path)
+        return
+    import threading
+    _ao_opt_8()                      # never two writers on one path
+    snapshot = _ao_opt_18(obj)
+    _ao_opt_9 = threading.Thread(target=torch.save, args=(snapshot, path))
+    _ao_opt_9.start()
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
+_ao_opt_10 = {}
+def _ao_eval_forward(X, Y):
+    key = (X.shape[0], X.shape[1])
+    if key not in _ao_opt_10:
+        sx, sy = X.clone(), Y.clone()
+        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                with ctx:
+                    model(sx, sy)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            with ctx:
+                _, sloss = model(sx, sy)
+        _ao_opt_10[key] = (sx, sy, g, sloss)
+    sx, sy, g, sloss = _ao_opt_10[key]
+    sx.copy_(X); sy.copy_(Y); g.replay()
+    return sloss
+
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
+        if ao_fast_eval and device_type == 'cuda':
+            acc = torch.zeros((), device=device, dtype=torch.float32)
+            for k in range(eval_iters):
+                X, Y = get_batch(split)
+                acc += _ao_eval_forward(X, Y).float()
+            out[split] = (acc / eval_iters).cpu()
+            continue
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
@@ -283,7 +386,7 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                _ao_save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -330,6 +433,7 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
+        _ao_opt_8()
         break
 
 if ddp:
